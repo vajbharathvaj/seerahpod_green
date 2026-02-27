@@ -1,3 +1,23 @@
 .vercel
 .env*.local
 node_modules/
+
+# Python
+__pycache__/
+*.pyc
+
+# Django
+*.sqlite3
+db.sqlite3
+media/
+staticfiles/
+
+# Env
+.env
+.env.*
+!.env.example
+
+# Virtual envs
+.venv/
+venv/
+env/
