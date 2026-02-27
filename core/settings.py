@@ -15,8 +15,22 @@ DEBUG = os.getenv('DJANGO_DEBUG', '1') == '1'
 allowed_hosts = os.getenv('DJANGO_ALLOWED_HOSTS', 'localhost,127.0.0.1').split(',')
 ALLOWED_HOSTS = [host.strip() for host in allowed_hosts if host.strip()]
 
+CORS_ALLOWED_ORIGINS = [
+    'https://seerahpodadmin-frontend.vercel.app',
+]
+
+CORS_ALLOWED_ORIGIN_REGEXES = [
+    r'^https:\/\/.*\.vercel\.app$',
+]
+
+CORS_ALLOW_CREDENTIALS = True
+CSRF_TRUSTED_ORIGINS = [
+    'https://seerahpodadmin-frontend.vercel.app',
+]
+
 
 INSTALLED_APPS = [
+    'corsheaders',
     'django.contrib.admin',
     'django.contrib.auth',
     'django.contrib.contenttypes',
@@ -28,6 +42,7 @@ INSTALLED_APPS = [
 ]
 
 MIDDLEWARE = [
+    'corsheaders.middleware.CorsMiddleware',
     'django.middleware.security.SecurityMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
     'django.middleware.common.CommonMiddleware',
