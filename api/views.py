@@ -20,12 +20,30 @@ from django.utils.dateparse import parse_datetime
 from rest_framework import serializers, status
 from rest_framework.views import APIView
 
-from .models import Category, PlayEvent, Playlist, PlaylistClickEvent, PlaylistTrack, RecommendationRule, SearchLog, SupportMessage, SupportTicket, Track, User, UserMfaBackupCode, UserMfaTotp, UserNotification, UserSession, UserSettings, UserTrackLike
+from .models import Category, PlatformSettings, PlayEvent, Playlist, PlaylistClickEvent, PlaylistTrack, RecommendationRule, SearchLog, SupportMessage, SupportTicket, Track, User, UserMfaBackupCode, UserMfaTotp, UserNotification, UserSession, UserSettings, UserTrackLike
 
 
 class HealthView(APIView):
     def get(self, request):
         return Response({'status': 'ok'})
+
+
+def _get_platform_settings():
+    settings_obj, _ = PlatformSettings.objects.get_or_create(singleton_key=1)
+    return settings_obj
+
+
+class PublicPlatformConfigView(APIView):
+    permission_classes = []
+
+    def get(self, request):
+        settings_obj = _get_platform_settings()
+        return Response(
+            {
+                'ok': True,
+                'display_advertisement': bool(settings_obj.display_advertisement),
+            }
+        )
 
 
 USER_ACCESS_TOKEN_TTL_MINUTES = getattr(settings, 'USER_ACCESS_TOKEN_TTL_MINUTES', 60)
@@ -228,6 +246,48 @@ def _verify_google_id_token(id_token: str):
 
     email = (payload.get('email') or '').strip().lower()
     sub = (payload.get('sub') or '').strip()
+    email_verified = payload.get('email_verified')
+    if isinstance(email_verified, str):
+        email_verified = email_verified.lower() == 'true'
+
+    if not email:
+        raise ValueError('Google token did not include an email.')
+    if not sub:
+        raise ValueError('Google token did not include a subject (sub).')
+    if email_verified is not True:
+        raise ValueError('Google email is not verified.')
+
+    return {'email': email, 'sub': sub}
+
+
+def _verify_google_access_token(access_token: str):
+    access_token = (access_token or '').strip()
+    if not access_token:
+        raise ValueError('Missing access_token.')
+
+    allowed_client_ids = _get_allowed_google_client_ids()
+    if not allowed_client_ids:
+        raise RuntimeError('Google OAuth client IDs are not configured on the server.')
+
+    url = 'https://oauth2.googleapis.com/tokeninfo?' + urllib_parse.urlencode({'access_token': access_token})
+    try:
+        with urllib_request.urlopen(url, timeout=10) as response:
+            payload = json.loads(response.read().decode('utf-8'))
+    except urllib_error.HTTPError as exc:
+        try:
+            details = json.loads(exc.read().decode('utf-8'))
+        except Exception:
+            details = {}
+        raise ValueError(details.get('error_description') or details.get('error') or 'Invalid Google token.') from exc
+    except Exception as exc:
+        raise RuntimeError('Unable to verify Google token.') from exc
+
+    aud = (payload.get('aud') or payload.get('issued_to') or '').strip()
+    if aud not in allowed_client_ids:
+        raise ValueError('Google token audience mismatch.')
+
+    email = (payload.get('email') or '').strip().lower()
+    sub = (payload.get('sub') or payload.get('user_id') or '').strip()
     email_verified = payload.get('email_verified')
     if isinstance(email_verified, str):
         email_verified = email_verified.lower() == 'true'
@@ -495,7 +555,17 @@ class UserLoginSerializer(serializers.Serializer):
 
 
 class UserGoogleLoginSerializer(serializers.Serializer):
-    id_token = serializers.CharField()
+    id_token = serializers.CharField(required=False, allow_blank=True)
+    access_token = serializers.CharField(required=False, allow_blank=True)
+
+    def validate(self, attrs):
+        id_token = (attrs.get('id_token') or '').strip()
+        access_token = (attrs.get('access_token') or '').strip()
+        if not id_token and not access_token:
+            raise serializers.ValidationError('Either id_token or access_token is required.')
+        attrs['id_token'] = id_token
+        attrs['access_token'] = access_token
+        return attrs
 
 
 class UserRefreshSerializer(serializers.Serializer):
@@ -742,7 +812,12 @@ class UserAuthGoogleView(APIView):
         serializer.is_valid(raise_exception=True)
 
         try:
-            verified = _verify_google_id_token(serializer.validated_data['id_token'])
+            id_token = serializer.validated_data.get('id_token')
+            access_token = serializer.validated_data.get('access_token')
+            if id_token:
+                verified = _verify_google_id_token(id_token)
+            else:
+                verified = _verify_google_access_token(access_token)
         except ValueError as exc:
             return Response({'detail': str(exc) or 'Invalid Google token.'}, status=status.HTTP_401_UNAUTHORIZED)
         except RuntimeError as exc:

@@ -320,6 +320,7 @@ class PlatformSettings(models.Model):
     allow_public_signup = models.BooleanField(default=True)
     require_email_verification = models.BooleanField(default=True)
     allow_guest_access = models.BooleanField(default=False)
+    display_advertisement = models.BooleanField(default=False)
 
     # Notification config
     enable_email_notifications = models.BooleanField(default=True)

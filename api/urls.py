@@ -4,6 +4,7 @@ from . import admin_insights, admin_v1, views
 
 urlpatterns = [
     path('health/', views.HealthView.as_view(), name='health'),
+    path('v1/platform/config/', views.PublicPlatformConfigView.as_view(), name='v1-platform-config'),
     path('v1/auth/signup/', views.UserAuthSignupView.as_view(), name='v1-user-auth-signup'),
     path('v1/auth/login/', views.UserAuthLoginView.as_view(), name='v1-user-auth-login'),
     path('v1/auth/google/config/', views.UserAuthGoogleConfigView.as_view(), name='v1-user-auth-google-config'),

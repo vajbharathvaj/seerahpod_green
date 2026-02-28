@@ -1713,6 +1713,7 @@ class PlatformSettingsSerializer(serializers.ModelSerializer):
             'allow_public_signup',
             'require_email_verification',
             'allow_guest_access',
+            'display_advertisement',
             'enable_email_notifications',
             'enable_push_notifications',
             'updated_at',
@@ -1725,6 +1726,7 @@ class PlatformSettingsUpdateSerializer(serializers.Serializer):
     allow_public_signup = serializers.BooleanField(required=False)
     require_email_verification = serializers.BooleanField(required=False)
     allow_guest_access = serializers.BooleanField(required=False)
+    display_advertisement = serializers.BooleanField(required=False)
     enable_email_notifications = serializers.BooleanField(required=False)
     enable_push_notifications = serializers.BooleanField(required=False)
 
@@ -1744,6 +1746,7 @@ class AdminPlatformSettingsView(APIView):
             'allow_public_signup': settings.allow_public_signup,
             'require_email_verification': settings.require_email_verification,
             'allow_guest_access': settings.allow_guest_access,
+            'display_advertisement': settings.display_advertisement,
             'enable_email_notifications': settings.enable_email_notifications,
             'enable_push_notifications': settings.enable_push_notifications,
         }
@@ -1757,6 +1760,7 @@ class AdminPlatformSettingsView(APIView):
             'allow_public_signup': settings.allow_public_signup,
             'require_email_verification': settings.require_email_verification,
             'allow_guest_access': settings.allow_guest_access,
+            'display_advertisement': settings.display_advertisement,
             'enable_email_notifications': settings.enable_email_notifications,
             'enable_push_notifications': settings.enable_push_notifications,
         }
