@@ -8,7 +8,7 @@ from django.utils import timezone
 from rest_framework import status
 from rest_framework.test import APITestCase
 
-from .models import AdminAuditLog, AdminSession, Category, PlayEvent, Playlist, PlaylistClickEvent, PlaylistTrack, RecommendationRule, SearchLog, SupportMessage, SupportTicket, Track, TrackCoverImage, User, UserMfaBackupCode, UserMfaTotp, UserNotification, UserSession, UserSettings, UserTrackLike
+from .models import AdminAuditLog, AdminSession, Category, PlayEvent, Playlist, PlaylistClickEvent, PlaylistTrack, RecommendationRule, SearchLog, Subscription, SupportMessage, SupportTicket, Track, TrackCoverImage, User, UserMfaBackupCode, UserMfaTotp, UserNotification, UserSession, UserSettings, UserTrackLike
 
 
 class AdminAuthAuditTests(APITestCase):
@@ -1005,6 +1005,15 @@ class UserAuthTests(APITestCase):
         )
 
         now = timezone.now()
+        Subscription.objects.create(
+            user=user,
+            plan_name='Premium',
+            provider=Subscription.Provider.GOOGLE_IAP,
+            status=Subscription.Status.ACTIVE,
+            started_at=now - timezone.timedelta(days=1),
+            ends_at=now + timezone.timedelta(days=30),
+            auto_renew=True,
+        )
         PlayEvent.objects.filter(id=old_a.id).update(created_at=now - timezone.timedelta(minutes=30))
         PlayEvent.objects.filter(id=latest_a.id).update(created_at=now - timezone.timedelta(minutes=10))
         PlayEvent.objects.filter(id=latest_b.id).update(created_at=now - timezone.timedelta(minutes=5))
@@ -1081,6 +1090,204 @@ class UserAuthTests(APITestCase):
         self.assertAlmostEqual(created.completion_percentage, 20.0, places=3)
         self.assertEqual(created.source, PlayEvent.Source.SEARCH)
         self.assertEqual(created.device_platform, PlayEvent.DevicePlatform.ANDROID)
+
+    def test_play_event_blocks_third_unique_track_for_non_premium_user(self):
+        user = User.objects.create(
+            email='paywall-limit@seerahpod.local',
+            auth_provider=User.AuthProvider.EMAIL,
+            role=User.Role.USER,
+            status=User.Status.ACTIVE,
+            password_hash=make_password('User@1234'),
+        )
+        session = UserSession.objects.create(
+            user=user,
+            access_token='pl' * 32,
+            refresh_token='pr' * 32,
+            access_expires_at=timezone.now() + timezone.timedelta(minutes=30),
+            refresh_expires_at=timezone.now() + timezone.timedelta(days=30),
+        )
+        category = Category.objects.create(name='Paywall Limit Category')
+        first = Track.objects.create(
+            title='First Free',
+            speaker_name='Speaker',
+            audio_url='https://cdn.example.com/first-free.mp3',
+            duration_seconds=180,
+            status=Track.Status.PUBLISHED,
+            visibility=Track.Visibility.PUBLIC,
+            category=category,
+        )
+        second = Track.objects.create(
+            title='Second Free',
+            speaker_name='Speaker',
+            audio_url='https://cdn.example.com/second-free.mp3',
+            duration_seconds=180,
+            status=Track.Status.PUBLISHED,
+            visibility=Track.Visibility.PUBLIC,
+            category=category,
+        )
+        third = Track.objects.create(
+            title='Third Locked',
+            speaker_name='Speaker',
+            audio_url='https://cdn.example.com/third-locked.mp3',
+            duration_seconds=180,
+            status=Track.Status.PUBLISHED,
+            visibility=Track.Visibility.PUBLIC,
+            category=category,
+        )
+
+        self.client.credentials(HTTP_AUTHORIZATION=f'Bearer {session.access_token}')
+        first_response = self.client.post(
+            '/api/v1/play-events/',
+            data={'track_id': str(first.id), 'played_seconds': 30, 'total_duration': 180},
+            format='json',
+        )
+        second_response = self.client.post(
+            '/api/v1/play-events/',
+            data={'track_id': str(second.id), 'played_seconds': 30, 'total_duration': 180},
+            format='json',
+        )
+        third_response = self.client.post(
+            '/api/v1/play-events/',
+            data={'track_id': str(third.id), 'played_seconds': 30, 'total_duration': 180},
+            format='json',
+        )
+
+        self.assertEqual(first_response.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(second_response.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(third_response.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertEqual(third_response.data['code'], 'paywall_required')
+        self.assertEqual(third_response.data['next_action'], 'upgrade_plan')
+        self.assertEqual(third_response.data['free_unique_tracks_limit'], 2)
+
+    def test_search_tracks_returns_paywall_required_after_two_unique_tracks_for_non_premium_user(self):
+        user = User.objects.create(
+            email='paywall-search@seerahpod.local',
+            auth_provider=User.AuthProvider.EMAIL,
+            role=User.Role.USER,
+            status=User.Status.ACTIVE,
+            password_hash=make_password('User@1234'),
+        )
+        session = UserSession.objects.create(
+            user=user,
+            access_token='ps' * 32,
+            refresh_token='pt' * 32,
+            access_expires_at=timezone.now() + timezone.timedelta(minutes=30),
+            refresh_expires_at=timezone.now() + timezone.timedelta(days=30),
+        )
+        category = Category.objects.create(name='Paywall Search Category')
+        listened_a = Track.objects.create(
+            title='Listened A',
+            speaker_name='Speaker',
+            audio_url='https://cdn.example.com/listened-a.mp3',
+            duration_seconds=180,
+            status=Track.Status.PUBLISHED,
+            visibility=Track.Visibility.PUBLIC,
+            category=category,
+        )
+        listened_b = Track.objects.create(
+            title='Listened B',
+            speaker_name='Speaker',
+            audio_url='https://cdn.example.com/listened-b.mp3',
+            duration_seconds=180,
+            status=Track.Status.PUBLISHED,
+            visibility=Track.Visibility.PUBLIC,
+            category=category,
+        )
+        Track.objects.create(
+            title='Searchable Track',
+            speaker_name='Speaker',
+            audio_url='https://cdn.example.com/searchable-track.mp3',
+            duration_seconds=180,
+            status=Track.Status.PUBLISHED,
+            visibility=Track.Visibility.PUBLIC,
+            category=category,
+        )
+        PlayEvent.objects.create(
+            user=user,
+            track=listened_a,
+            played_seconds=60,
+            total_duration=180,
+            completion_percentage=33.3,
+            source=PlayEvent.Source.HOME,
+            device_platform=PlayEvent.DevicePlatform.ANDROID,
+        )
+        PlayEvent.objects.create(
+            user=user,
+            track=listened_b,
+            played_seconds=60,
+            total_duration=180,
+            completion_percentage=33.3,
+            source=PlayEvent.Source.HOME,
+            device_platform=PlayEvent.DevicePlatform.ANDROID,
+        )
+
+        self.client.credentials(HTTP_AUTHORIZATION=f'Bearer {session.access_token}')
+        response = self.client.get('/api/v1/search/tracks/?q=searchable&limit=10')
+
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertEqual(response.data['code'], 'paywall_required')
+
+    def test_subscription_status_reports_paywall_locked_after_two_unique_tracks(self):
+        user = User.objects.create(
+            email='paywall-status@seerahpod.local',
+            auth_provider=User.AuthProvider.EMAIL,
+            role=User.Role.USER,
+            status=User.Status.ACTIVE,
+            password_hash=make_password('User@1234'),
+        )
+        session = UserSession.objects.create(
+            user=user,
+            access_token='pw' * 32,
+            refresh_token='px' * 32,
+            access_expires_at=timezone.now() + timezone.timedelta(minutes=30),
+            refresh_expires_at=timezone.now() + timezone.timedelta(days=30),
+        )
+        category = Category.objects.create(name='Paywall Status Category')
+        first = Track.objects.create(
+            title='Status A',
+            speaker_name='Speaker',
+            audio_url='https://cdn.example.com/status-a.mp3',
+            duration_seconds=180,
+            status=Track.Status.PUBLISHED,
+            visibility=Track.Visibility.PUBLIC,
+            category=category,
+        )
+        second = Track.objects.create(
+            title='Status B',
+            speaker_name='Speaker',
+            audio_url='https://cdn.example.com/status-b.mp3',
+            duration_seconds=180,
+            status=Track.Status.PUBLISHED,
+            visibility=Track.Visibility.PUBLIC,
+            category=category,
+        )
+        PlayEvent.objects.create(
+            user=user,
+            track=first,
+            played_seconds=40,
+            total_duration=180,
+            completion_percentage=22.2,
+            source=PlayEvent.Source.HOME,
+            device_platform=PlayEvent.DevicePlatform.ANDROID,
+        )
+        PlayEvent.objects.create(
+            user=user,
+            track=second,
+            played_seconds=40,
+            total_duration=180,
+            completion_percentage=22.2,
+            source=PlayEvent.Source.HOME,
+            device_platform=PlayEvent.DevicePlatform.ANDROID,
+        )
+
+        self.client.credentials(HTTP_AUTHORIZATION=f'Bearer {session.access_token}')
+        response = self.client.get('/api/v1/auth/subscription/status/')
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertFalse(response.data['is_active'])
+        self.assertEqual(response.data['free_unique_tracks_used'], 2)
+        self.assertEqual(response.data['free_unique_tracks_limit'], 2)
+        self.assertTrue(response.data['is_paywall_locked'])
 
     def test_home_continue_listening_requires_authentication(self):
         response = self.client.get('/api/v1/home/continue-listening/')
@@ -1186,6 +1393,15 @@ class UserAuthTests(APITestCase):
         )
 
         now = timezone.now()
+        Subscription.objects.create(
+            user=user,
+            plan_name='Premium',
+            provider=Subscription.Provider.GOOGLE_IAP,
+            status=Subscription.Status.ACTIVE,
+            started_at=now - timezone.timedelta(days=1),
+            ends_at=now + timezone.timedelta(days=30),
+            auto_renew=True,
+        )
         PlayEvent.objects.filter(id=old_a.id).update(created_at=now - timezone.timedelta(minutes=25))
         PlayEvent.objects.filter(id=latest_a.id).update(created_at=now - timezone.timedelta(minutes=10))
         PlayEvent.objects.filter(id=completed_b.id).update(created_at=now - timezone.timedelta(minutes=8))
@@ -1204,6 +1420,72 @@ class UserAuthTests(APITestCase):
         )
         self.assertEqual(response.data['results'][0]['progress_percent'], 20.0)
         self.assertEqual(response.data['results'][1]['progress_percent'], 45.0)
+
+    def test_subscription_status_requires_auth(self):
+        response = self.client.get('/api/v1/auth/subscription/status/')
+        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
+
+    def test_google_billing_verify_creates_active_subscription_and_status_endpoint_reports_it(self):
+        user = User.objects.create(
+            email='billing-user@seerahpod.local',
+            auth_provider=User.AuthProvider.EMAIL,
+            role=User.Role.USER,
+            status=User.Status.ACTIVE,
+            password_hash=make_password('User@1234'),
+        )
+        session = UserSession.objects.create(
+            user=user,
+            access_token='gb' * 32,
+            refresh_token='gr' * 32,
+            access_expires_at=timezone.now() + timezone.timedelta(minutes=30),
+            refresh_expires_at=timezone.now() + timezone.timedelta(days=30),
+        )
+        self.client.credentials(HTTP_AUTHORIZATION=f'Bearer {session.access_token}')
+
+        verify_response = self.client.post(
+            '/api/v1/billing/google/verify/',
+            data={
+                'purchaseToken': 'test-token-123',
+                'productId': 'seerahpod_premium_monthly',
+                'basePlanId': 'monthly_500_gbp',
+                'packageName': 'com.seerahpod.app',
+            },
+            format='json',
+        )
+        self.assertEqual(verify_response.status_code, status.HTTP_200_OK)
+        self.assertTrue(verify_response.data['ok'])
+        self.assertTrue(verify_response.data['verified'])
+        self.assertIn(
+            verify_response.data.get('verification_source'),
+            ['google_play', 'fallback'],
+        )
+        self.assertTrue(verify_response.data['is_active'])
+        self.assertEqual(verify_response.data['status'], Subscription.Status.ACTIVE)
+        self.assertEqual(
+            verify_response.data['subscription']['provider'],
+            Subscription.Provider.GOOGLE_IAP,
+        )
+        self.assertEqual(
+            Subscription.objects.filter(
+                user=user,
+                provider=Subscription.Provider.GOOGLE_IAP,
+                status=Subscription.Status.ACTIVE,
+            ).count(),
+            1,
+        )
+
+        status_response = self.client.get('/api/v1/auth/subscription/status/')
+        self.assertEqual(status_response.status_code, status.HTTP_200_OK)
+        self.assertTrue(status_response.data['ok'])
+        self.assertTrue(status_response.data['is_active'])
+        self.assertEqual(status_response.data['status'], Subscription.Status.ACTIVE)
+        self.assertEqual(status_response.data['free_unique_tracks_limit'], 2)
+        self.assertEqual(status_response.data['free_unique_tracks_used'], 0)
+        self.assertFalse(status_response.data['is_paywall_locked'])
+        self.assertEqual(
+            status_response.data['subscription']['provider'],
+            Subscription.Provider.GOOGLE_IAP,
+        )
 
 
 class AdminTrackViewsTests(APITestCase):
@@ -2010,7 +2292,7 @@ class AdminTrackViewsTests(APITestCase):
         )
         newer = Playlist.objects.create(
             title='Newer Playlist',
-            visibility=Playlist.Visibility.PREMIUM,
+            visibility=Playlist.Visibility.PUBLIC,
             is_active=True,
         )
         hidden = Playlist.objects.create(
@@ -2221,7 +2503,7 @@ class AdminTrackViewsTests(APITestCase):
         )
         second = Playlist.objects.create(
             title='Second Playlist',
-            visibility=Playlist.Visibility.PREMIUM,
+            visibility=Playlist.Visibility.PUBLIC,
             is_active=True,
         )
         old_only = Playlist.objects.create(

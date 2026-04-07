@@ -4,6 +4,7 @@ import hashlib
 import hmac
 import secrets
 import string
+import os
 from urllib import error as urllib_error
 from urllib import parse as urllib_parse
 from urllib import request as urllib_request
@@ -20,7 +21,7 @@ from django.utils.dateparse import parse_datetime
 from rest_framework import serializers, status
 from rest_framework.views import APIView
 
-from .models import Category, PlatformSettings, PlayEvent, Playlist, PlaylistClickEvent, PlaylistTrack, RecommendationRule, SearchLog, SupportMessage, SupportTicket, Track, User, UserMfaBackupCode, UserMfaTotp, UserNotification, UserSession, UserSettings, UserTrackLike
+from .models import Category, PlatformSettings, PlayEvent, Playlist, PlaylistClickEvent, PlaylistTrack, RecommendationRule, SearchLog, Subscription, SupportMessage, SupportTicket, Track, User, UserMfaBackupCode, UserMfaTotp, UserNotification, UserSession, UserSettings, UserTrackLike
 
 
 class HealthView(APIView):
@@ -50,6 +51,7 @@ USER_ACCESS_TOKEN_TTL_MINUTES = getattr(settings, 'USER_ACCESS_TOKEN_TTL_MINUTES
 USER_REFRESH_TOKEN_TTL_DAYS = getattr(settings, 'USER_REFRESH_TOKEN_TTL_DAYS', 30)
 USER_LOGIN_2FA_TOKEN_MAX_AGE_SECONDS = getattr(settings, 'USER_LOGIN_2FA_TOKEN_MAX_AGE_SECONDS', 300)
 LIKED_SONGS_PLAYLIST_ID = uuid.UUID('00000000-0000-0000-0000-00000000f00d')
+FREE_UNIQUE_TRACK_LIMIT = 2
 
 
 def _get_google_server_client_id():
@@ -302,6 +304,110 @@ def _verify_google_access_token(access_token: str):
     return {'email': email, 'sub': sub}
 
 
+def _google_play_service_account_info():
+    inline_json = (getattr(settings, 'GOOGLE_PLAY_SERVICE_ACCOUNT_JSON', '') or '').strip()
+    if inline_json:
+        return json.loads(inline_json)
+
+    path_value = (getattr(settings, 'GOOGLE_PLAY_SERVICE_ACCOUNT_FILE', '') or '').strip()
+    if not path_value:
+        return None
+    expanded_path = os.path.expanduser(path_value)
+    with open(expanded_path, 'r', encoding='utf-8') as file_obj:
+        return json.load(file_obj)
+
+
+def _map_google_subscription_state_to_internal(state_value: str):
+    state = (state_value or '').strip().upper()
+    if state in {'SUBSCRIPTION_STATE_ACTIVE', 'SUBSCRIPTION_STATE_IN_GRACE_PERIOD', 'SUBSCRIPTION_STATE_ON_HOLD'}:
+        return Subscription.Status.ACTIVE, True
+    if state in {'SUBSCRIPTION_STATE_CANCELED', 'SUBSCRIPTION_STATE_PAUSED'}:
+        return Subscription.Status.CANCELLED, False
+    if state in {'SUBSCRIPTION_STATE_EXPIRED', 'SUBSCRIPTION_STATE_PENDING'}:
+        return Subscription.Status.EXPIRED, False
+    return Subscription.Status.EXPIRED, False
+
+
+def _verify_google_play_subscription_purchase(*, package_name: str, purchase_token: str):
+    account_info = _google_play_service_account_info()
+    if not account_info:
+        raise RuntimeError('Google Play service account is not configured.')
+
+    try:
+        from google.auth.transport.requests import Request as GoogleAuthRequest
+        from google.oauth2 import service_account
+    except Exception as exc:
+        raise RuntimeError('google-auth dependency is missing for Google Play verification.') from exc
+
+    credentials = service_account.Credentials.from_service_account_info(
+        account_info,
+        scopes=['https://www.googleapis.com/auth/androidpublisher'],
+    )
+    credentials.refresh(GoogleAuthRequest())
+    access_token = credentials.token
+    if not access_token:
+        raise RuntimeError('Unable to obtain access token for Google Play verification.')
+
+    encoded_package = urllib_parse.quote((package_name or '').strip(), safe='')
+    encoded_token = urllib_parse.quote((purchase_token or '').strip(), safe='')
+    url = (
+        'https://androidpublisher.googleapis.com/androidpublisher/v3/applications/'
+        f'{encoded_package}/purchases/subscriptionsv2/tokens/{encoded_token}'
+    )
+    request_obj = urllib_request.Request(
+        url,
+        headers={'Authorization': f'Bearer {access_token}'},
+        method='GET',
+    )
+
+    try:
+        with urllib_request.urlopen(request_obj, timeout=15) as response:
+            payload = json.loads(response.read().decode('utf-8'))
+    except urllib_error.HTTPError as exc:
+        details = {}
+        try:
+            details = json.loads(exc.read().decode('utf-8'))
+        except Exception:
+            pass
+        detail_message = ''
+        if isinstance(details, dict):
+            error_block = details.get('error') if isinstance(details.get('error'), dict) else {}
+            detail_message = (
+                (error_block.get('message') if isinstance(error_block, dict) else '')
+                or details.get('message')
+                or ''
+            ).strip()
+        raise ValueError(detail_message or 'Google Play rejected this purchase token.') from exc
+    except Exception as exc:
+        raise RuntimeError('Unable to contact Google Play for subscription verification.') from exc
+
+    line_items = payload.get('lineItems') if isinstance(payload, dict) else []
+    line_item = line_items[0] if isinstance(line_items, list) and line_items else {}
+    expiry_raw = ''
+    if isinstance(line_item, dict):
+        expiry_raw = (line_item.get('expiryTime') or '').strip()
+    expiry_at = parse_datetime(expiry_raw) if expiry_raw else None
+    if expiry_at is not None and timezone.is_naive(expiry_at):
+        expiry_at = timezone.make_aware(expiry_at, timezone.get_current_timezone())
+
+    internal_status, is_active = _map_google_subscription_state_to_internal(
+        payload.get('subscriptionState') if isinstance(payload, dict) else '',
+    )
+    auto_renew = False
+    if isinstance(line_item, dict):
+        auto_renewing_plan = line_item.get('autoRenewingPlan')
+        if isinstance(auto_renewing_plan, dict):
+            auto_renew = auto_renewing_plan.get('autoRenewEnabled') is True
+
+    return {
+        'payload': payload if isinstance(payload, dict) else {},
+        'is_active': bool(is_active),
+        'status': internal_status,
+        'ends_at': expiry_at,
+        'auto_renew': bool(auto_renew),
+    }
+
+
 def _get_bearer_token(request):
     auth_header = request.META.get('HTTP_AUTHORIZATION', '')
     if not auth_header.startswith('Bearer '):
@@ -324,6 +430,95 @@ def _get_active_user_session_from_request(request):
     if session.user.status != User.Status.ACTIVE:
         return None
     return session
+
+
+def _get_active_subscription_for_user(user):
+    if user is None:
+        return None
+
+    now = timezone.now()
+    return (
+        Subscription.objects.filter(
+            user=user,
+            started_at__lte=now,
+            ends_at__gt=now,
+            status__in=[Subscription.Status.TRIAL, Subscription.Status.ACTIVE],
+        )
+        .order_by('-ends_at', '-created_at')
+        .first()
+    )
+
+
+def _serialize_subscription(subscription):
+    if subscription is None:
+        return None
+
+    now = timezone.now()
+    return {
+        'id': str(subscription.id),
+        'plan_name': subscription.plan_name,
+        'provider': subscription.provider,
+        'status': subscription.status,
+        'is_active': bool(subscription.started_at <= now < subscription.ends_at),
+        'started_at': subscription.started_at,
+        'ends_at': subscription.ends_at,
+        'auto_renew': bool(subscription.auto_renew),
+        'created_at': subscription.created_at,
+    }
+
+
+def _resolve_subscription_context(request):
+    session = _get_active_user_session_from_request(request)
+    if session is None:
+        return None, None
+    subscription = _get_active_subscription_for_user(session.user)
+    return session, subscription
+
+
+def _count_user_unique_played_tracks(user):
+    if user is None:
+        return 0
+    return (
+        PlayEvent.objects.filter(user=user)
+        .values('track_id')
+        .distinct()
+        .count()
+    )
+
+
+def _has_user_played_track(user, track_id):
+    if user is None:
+        return False
+    return PlayEvent.objects.filter(user=user, track_id=track_id).exists()
+
+
+def _is_paywall_locked(*, session, subscription):
+    if session is None or subscription is not None:
+        return False
+    return _count_user_unique_played_tracks(session.user) >= FREE_UNIQUE_TRACK_LIMIT
+
+
+def _resolve_paywall_context(request):
+    session, subscription = _resolve_subscription_context(request)
+    return session, subscription, _is_paywall_locked(session=session, subscription=subscription)
+
+
+def _premium_track_access_q(has_premium_access: bool, prefix: str = ''):
+    if has_premium_access:
+        return Q()
+    return Q(**{f'{prefix}is_premium': False})
+
+
+def _premium_required_response():
+    return Response(
+        {
+            'detail': f'Free limit reached. Upgrade to continue after {FREE_UNIQUE_TRACK_LIMIT} unique tracks.',
+            'code': 'paywall_required',
+            'next_action': 'upgrade_plan',
+            'free_unique_tracks_limit': FREE_UNIQUE_TRACK_LIMIT,
+        },
+        status=status.HTTP_403_FORBIDDEN,
+    )
 
 
 def _sanitize_username_base(value: str) -> str:
@@ -570,6 +765,13 @@ class UserGoogleLoginSerializer(serializers.Serializer):
 
 class UserRefreshSerializer(serializers.Serializer):
     refresh_token = serializers.CharField()
+
+
+class GoogleBillingVerifySerializer(serializers.Serializer):
+    purchaseToken = serializers.CharField()
+    productId = serializers.CharField()
+    basePlanId = serializers.CharField(required=False, allow_blank=True, allow_null=True)
+    packageName = serializers.CharField()
 
 
 class UserProfileUpdateSerializer(serializers.Serializer):
@@ -958,6 +1160,141 @@ class UserAuthMeView(APIView):
             session.user.save(update_fields=['username', 'updated_at'])
 
         return Response({'ok': True, 'user': _serialize_user(session.user)})
+
+
+class UserSubscriptionStatusView(APIView):
+    permission_classes = []
+
+    def get(self, request, **kwargs):
+        session, subscription, is_paywall_locked = _resolve_paywall_context(request)
+        if session is None:
+            return Response({'detail': 'Not authenticated.'}, status=status.HTTP_401_UNAUTHORIZED)
+
+        free_unique_tracks_used = _count_user_unique_played_tracks(session.user)
+        return Response(
+            {
+                'ok': True,
+                'is_active': subscription is not None,
+                'status': subscription.status if subscription else 'inactive',
+                'subscription': _serialize_subscription(subscription),
+                'free_unique_tracks_limit': FREE_UNIQUE_TRACK_LIMIT,
+                'free_unique_tracks_used': int(free_unique_tracks_used),
+                'is_paywall_locked': bool(is_paywall_locked),
+            }
+        )
+
+
+class GoogleBillingVerifyView(APIView):
+    permission_classes = []
+
+    def post(self, request, **kwargs):
+        session = _get_active_user_session_from_request(request)
+        if session is None:
+            return Response({'detail': 'Not authenticated.'}, status=status.HTTP_401_UNAUTHORIZED)
+
+        serializer = GoogleBillingVerifySerializer(data=request.data or {})
+        serializer.is_valid(raise_exception=True)
+        payload = serializer.validated_data
+
+        now = timezone.now()
+        default_ends_at = now + timezone.timedelta(days=30)
+        strict_verify = bool(getattr(settings, 'GOOGLE_PLAY_STRICT_VERIFY', False))
+        verification_source = 'fallback'
+        verified_payload = None
+        try:
+            verified_payload = _verify_google_play_subscription_purchase(
+                package_name=(payload.get('packageName') or '').strip(),
+                purchase_token=(payload.get('purchaseToken') or '').strip(),
+            )
+            verification_source = 'google_play'
+        except ValueError as exc:
+            return Response(
+                {
+                    'detail': str(exc) or 'Invalid Google Play purchase.',
+                    'code': 'invalid_purchase',
+                    'next_action': 'retry_purchase',
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        except RuntimeError as exc:
+            if strict_verify:
+                return Response(
+                    {
+                        'detail': str(exc) or 'Google Play verification is unavailable.',
+                        'code': 'billing_unavailable',
+                        'next_action': 'retry_later',
+                    },
+                    status=status.HTTP_503_SERVICE_UNAVAILABLE,
+                )
+
+        subscription = (
+            Subscription.objects.filter(
+                user=session.user,
+                provider=Subscription.Provider.GOOGLE_IAP,
+            )
+            .order_by('-ends_at', '-created_at')
+            .first()
+        )
+
+        resolved_status = (
+            verified_payload['status']
+            if isinstance(verified_payload, dict) and 'status' in verified_payload
+            else Subscription.Status.ACTIVE
+        )
+        resolved_is_active = bool(
+            verified_payload['is_active']
+            if isinstance(verified_payload, dict) and 'is_active' in verified_payload
+            else True
+        )
+        resolved_ends_at = (
+            verified_payload['ends_at']
+            if isinstance(verified_payload, dict) and verified_payload.get('ends_at')
+            else (default_ends_at if resolved_is_active else now)
+        )
+        resolved_auto_renew = bool(
+            verified_payload['auto_renew']
+            if isinstance(verified_payload, dict) and 'auto_renew' in verified_payload
+            else True
+        )
+        resolved_plan_name = (payload.get('productId') or 'google_iap').strip() or 'google_iap'
+
+        if subscription is None:
+            subscription = Subscription.objects.create(
+                user=session.user,
+                plan_name=resolved_plan_name,
+                provider=Subscription.Provider.GOOGLE_IAP,
+                status=resolved_status,
+                started_at=now,
+                ends_at=resolved_ends_at,
+                auto_renew=resolved_auto_renew,
+            )
+        else:
+            subscription.plan_name = resolved_plan_name or subscription.plan_name
+            subscription.status = resolved_status
+            subscription.started_at = min(subscription.started_at, now)
+            subscription.ends_at = resolved_ends_at
+            subscription.auto_renew = resolved_auto_renew
+            subscription.save(
+                update_fields=[
+                    'plan_name',
+                    'status',
+                    'started_at',
+                    'ends_at',
+                    'auto_renew',
+                ]
+            )
+
+        return Response(
+            {
+                'ok': True,
+                'verified': True,
+                'verification_source': verification_source,
+                'is_active': resolved_is_active,
+                'status': subscription.status,
+                'provider': subscription.provider,
+                'subscription': _serialize_subscription(subscription),
+            }
+        )
 
 
 class UserAuthPasswordChangeView(APIView):
@@ -1373,7 +1710,7 @@ class UserAuthNotificationsMarkAllReadView(APIView):
 class UserTrackLikeView(APIView):
     permission_classes = []
 
-    def _get_playable_track(self, track_id):
+    def _get_playable_track(self, track_id, *, has_premium_access: bool):
         return (
             Track.objects.filter(
                 id=track_id,
@@ -1381,16 +1718,17 @@ class UserTrackLikeView(APIView):
                 status=Track.Status.PUBLISHED,
                 visibility=Track.Visibility.PUBLIC,
             )
+            .filter(_premium_track_access_q(has_premium_access))
             .filter(_playable_track_q())
             .first()
         )
 
     def get(self, request, id, **kwargs):
-        session = _get_active_user_session_from_request(request)
+        session, subscription = _resolve_subscription_context(request)
         if session is None:
             return Response({'detail': 'Not authenticated.'}, status=status.HTTP_401_UNAUTHORIZED)
 
-        track = self._get_playable_track(id)
+        track = self._get_playable_track(id, has_premium_access=subscription is not None)
         if track is None:
             return Response({'detail': 'Track not found.'}, status=status.HTTP_404_NOT_FOUND)
 
@@ -1404,11 +1742,11 @@ class UserTrackLikeView(APIView):
         )
 
     def post(self, request, id, **kwargs):
-        session = _get_active_user_session_from_request(request)
+        session, subscription = _resolve_subscription_context(request)
         if session is None:
             return Response({'detail': 'Not authenticated.'}, status=status.HTTP_401_UNAUTHORIZED)
 
-        track = self._get_playable_track(id)
+        track = self._get_playable_track(id, has_premium_access=subscription is not None)
         if track is None:
             return Response({'detail': 'Track not found.'}, status=status.HTTP_404_NOT_FOUND)
 
@@ -1733,7 +2071,7 @@ class RecommendationsFeedView(APIView):
 
         return days, limit
 
-    def _recently_added_tracks(self, rule):
+    def _recently_added_tracks(self, rule, *, has_premium_access: bool):
         days, limit = self._parse_days_and_limit(rule, default_days=2)
 
         cutoff = timezone.now() - timezone.timedelta(days=days)
@@ -1744,13 +2082,14 @@ class RecommendationsFeedView(APIView):
                 visibility=Track.Visibility.PUBLIC,
                 created_at__gte=cutoff,
             )
+            .filter(_premium_track_access_q(has_premium_access))
             .filter(_playable_track_q())
             .select_related('category').prefetch_related('cover_images')
             .order_by('-created_at')[:limit]
         )
         return list(queryset)
 
-    def _top_played_tracks(self, rule):
+    def _top_played_tracks(self, rule, *, has_premium_access: bool):
         days, limit = self._parse_days_and_limit(rule, default_days=7)
         cutoff = timezone.now() - timezone.timedelta(days=days)
 
@@ -1761,6 +2100,7 @@ class RecommendationsFeedView(APIView):
                 track__status=Track.Status.PUBLISHED,
                 track__visibility=Track.Visibility.PUBLIC,
             )
+            .filter(_premium_track_access_q(has_premium_access, 'track__'))
             .values('track_id')
             .annotate(
                 play_count=Count('id'),
@@ -1778,12 +2118,13 @@ class RecommendationsFeedView(APIView):
         )
         tracks = (
             Track.objects.filter(id__in=ranked_track_ids)
+            .filter(_premium_track_access_q(has_premium_access))
             .select_related('category').prefetch_related('cover_images')
             .order_by(preserved_order)
         )
         return list(tracks)
 
-    def _based_on_history_tracks(self, rule, user_id):
+    def _based_on_history_tracks(self, rule, user_id, *, has_premium_access: bool):
         if not user_id:
             return []
         try:
@@ -1824,7 +2165,7 @@ class RecommendationsFeedView(APIView):
             track__deleted_at__isnull=True,
             track__status=Track.Status.PUBLISHED,
             track__visibility=Track.Visibility.PUBLIC,
-        )
+        ).filter(_premium_track_access_q(has_premium_access, 'track__'))
 
         if user_events.count() < min_listens:
             return []
@@ -1854,6 +2195,7 @@ class RecommendationsFeedView(APIView):
                 visibility=Track.Visibility.PUBLIC,
                 category_id__in=category_ids,
             )
+            .filter(_premium_track_access_q(has_premium_access))
             .filter(_playable_track_q())
             .annotate(
                 category_rank=category_rank,
@@ -1866,17 +2208,21 @@ class RecommendationsFeedView(APIView):
         return list(tracks)
 
     def get(self, request):
+        _, subscription, is_paywall_locked = _resolve_paywall_context(request)
+        if is_paywall_locked:
+            return _premium_required_response()
+        has_premium_access = subscription is not None
         user_id = request.query_params.get('user_id')
         active_rules = RecommendationRule.objects.filter(is_active=True).order_by('priority', 'created_at')
         sections = []
 
         for rule in active_rules:
             if rule.rule_key == 'top_played':
-                tracks = self._top_played_tracks(rule)
+                tracks = self._top_played_tracks(rule, has_premium_access=has_premium_access)
             elif rule.rule_key == 'recently_added':
-                tracks = self._recently_added_tracks(rule)
+                tracks = self._recently_added_tracks(rule, has_premium_access=has_premium_access)
             elif rule.rule_key == 'based_on_history':
-                tracks = self._based_on_history_tracks(rule, user_id)
+                tracks = self._based_on_history_tracks(rule, user_id, has_premium_access=has_premium_access)
             else:
                 continue
 
@@ -1897,6 +2243,10 @@ class RecommendationsFeedView(APIView):
 
 class TrendingPodcastsView(APIView):
     def get(self, request):
+        _, subscription, is_paywall_locked = _resolve_paywall_context(request)
+        if is_paywall_locked:
+            return _premium_required_response()
+        has_premium_access = subscription is not None
         days = request.query_params.get('days', 30)
         limit = request.query_params.get('limit', 10)
         try:
@@ -1918,6 +2268,7 @@ class TrendingPodcastsView(APIView):
                 track__status=Track.Status.PUBLISHED,
                 track__visibility=Track.Visibility.PUBLIC,
             )
+            .filter(_premium_track_access_q(has_premium_access, 'track__'))
             .filter(podcast_name_filter)
             .values(
                 'track_id',
@@ -1952,6 +2303,7 @@ class TrendingPodcastsView(APIView):
                     status=Track.Status.PUBLISHED,
                     visibility=Track.Visibility.PUBLIC,
                 )
+                .filter(_premium_track_access_q(has_premium_access))
                 .filter(Q(category__name__iexact='podcast') | Q(category__name__icontains='podcast'))
                 .select_related('category').prefetch_related('cover_images')
                 .order_by('-created_at')[:limit]
@@ -1983,7 +2335,7 @@ class PlayEventCreateView(APIView):
     permission_classes = []
 
     def post(self, request):
-        session = _get_active_user_session_from_request(request)
+        session, subscription, is_paywall_locked = _resolve_paywall_context(request)
         if session is None:
             return Response({'detail': 'Not authenticated.'}, status=status.HTTP_401_UNAUTHORIZED)
 
@@ -2003,6 +2355,10 @@ class PlayEventCreateView(APIView):
         )
         if track is None:
             return Response({'detail': 'Track not found.'}, status=status.HTTP_404_NOT_FOUND)
+        if subscription is None:
+            already_played = _has_user_played_track(session.user, track.id)
+            if is_paywall_locked and not already_played:
+                return _premium_required_response()
 
         fallback_duration = track.duration_seconds if (track.duration_seconds or 0) > 0 else 1
         total_duration = payload.get('total_duration') or fallback_duration
@@ -2055,9 +2411,12 @@ class HomeContinueListeningView(APIView):
     permission_classes = []
 
     def get(self, request):
-        session = _get_active_user_session_from_request(request)
+        session, subscription, is_paywall_locked = _resolve_paywall_context(request)
         if session is None:
             return Response({'detail': 'Not authenticated.'}, status=status.HTTP_401_UNAUTHORIZED)
+        if is_paywall_locked:
+            return _premium_required_response()
+        has_premium_access = subscription is not None
 
         limit = request.query_params.get('limit', 5)
         try:
@@ -2085,6 +2444,7 @@ class HomeContinueListeningView(APIView):
                 track__status=Track.Status.PUBLISHED,
                 track__visibility=Track.Visibility.PUBLIC,
             )
+            .filter(_premium_track_access_q(has_premium_access, 'track__'))
             .filter(_playable_track_q('track__'))
             .select_related('track').prefetch_related('track__cover_images')
             .order_by('-created_at')
@@ -2154,9 +2514,12 @@ class HomeRecentlyPlayedView(APIView):
     permission_classes = []
 
     def get(self, request):
-        session = _get_active_user_session_from_request(request)
+        session, subscription, is_paywall_locked = _resolve_paywall_context(request)
         if session is None:
             return Response({'detail': 'Not authenticated.'}, status=status.HTTP_401_UNAUTHORIZED)
+        if is_paywall_locked:
+            return _premium_required_response()
+        has_premium_access = subscription is not None
 
         limit = request.query_params.get('limit', 20)
         try:
@@ -2171,6 +2534,7 @@ class HomeRecentlyPlayedView(APIView):
                 track__status=Track.Status.PUBLISHED,
                 track__visibility=Track.Visibility.PUBLIC,
             )
+            .filter(_premium_track_access_q(has_premium_access, 'track__'))
             .filter(_playable_track_q('track__'))
             .select_related('track').prefetch_related('track__cover_images')
             .order_by('-created_at')
@@ -2214,7 +2578,7 @@ class HomeRecentlyPlayedView(APIView):
         )
 
 
-def _playlist_preview_cover_urls(playlist_id, *, limit=4):
+def _playlist_preview_cover_urls(playlist_id, *, limit=4, has_premium_access: bool = False):
     rows = (
         PlaylistTrack.objects.filter(
             playlist_id=playlist_id,
@@ -2222,6 +2586,7 @@ def _playlist_preview_cover_urls(playlist_id, *, limit=4):
             track__status=Track.Status.PUBLISHED,
             track__visibility=Track.Visibility.PUBLIC,
         )
+        .filter(_premium_track_access_q(has_premium_access, 'track__'))
         .filter(_playable_track_q('track__'))
         .exclude(track__cover_image_url__isnull=True)
         .exclude(track__cover_image_url__exact='')
@@ -2231,7 +2596,7 @@ def _playlist_preview_cover_urls(playlist_id, *, limit=4):
     return [row.track.cover_image_url for row in rows]
 
 
-def _liked_tracks_queryset_for_user(user):
+def _liked_tracks_queryset_for_user(user, *, has_premium_access: bool = False):
     return (
         UserTrackLike.objects.filter(
             user=user,
@@ -2239,6 +2604,7 @@ def _liked_tracks_queryset_for_user(user):
             track__status=Track.Status.PUBLISHED,
             track__visibility=Track.Visibility.PUBLIC,
         )
+        .filter(_premium_track_access_q(has_premium_access, 'track__'))
         .filter(_playable_track_q('track__'))
         .select_related('track')
         .prefetch_related('track__cover_images')
@@ -2246,8 +2612,8 @@ def _liked_tracks_queryset_for_user(user):
     )
 
 
-def _serialize_liked_songs_playlist_summary(*, user):
-    liked_rows = list(_liked_tracks_queryset_for_user(user)[:4])
+def _serialize_liked_songs_playlist_summary(*, user, has_premium_access: bool = False):
+    liked_rows = list(_liked_tracks_queryset_for_user(user, has_premium_access=has_premium_access)[:4])
     preview_cover_image_urls = []
     for row in liked_rows:
         for cover in _track_cover_image_urls(row.track):
@@ -2258,7 +2624,7 @@ def _serialize_liked_songs_playlist_summary(*, user):
         if len(preview_cover_image_urls) >= 4:
             break
 
-    track_count = _liked_tracks_queryset_for_user(user).count()
+    track_count = _liked_tracks_queryset_for_user(user, has_premium_access=has_premium_access).count()
     primary_cover = preview_cover_image_urls[0] if preview_cover_image_urls else None
     return {
         'id': str(LIKED_SONGS_PLAYLIST_ID),
@@ -2273,13 +2639,18 @@ def _serialize_liked_songs_playlist_summary(*, user):
     }
 
 
-def _active_public_playlists_queryset():
+def _active_public_playlists_queryset(*, has_premium_access: bool = False):
+    if has_premium_access:
+        visibility_filter = ~Q(visibility=Playlist.Visibility.HIDDEN)
+    else:
+        visibility_filter = Q(visibility=Playlist.Visibility.PUBLIC)
+
     return (
         Playlist.objects.filter(
             deleted_at__isnull=True,
             is_active=True,
         )
-        .exclude(visibility=Playlist.Visibility.HIDDEN)
+        .filter(visibility_filter)
         .annotate(
             track_count=Count(
                 'playlisttrack',
@@ -2287,7 +2658,7 @@ def _active_public_playlists_queryset():
                     playlisttrack__track__deleted_at__isnull=True,
                     playlisttrack__track__status=Track.Status.PUBLISHED,
                     playlisttrack__track__visibility=Track.Visibility.PUBLIC,
-                ) & _playable_track_q('playlisttrack__track__'),
+                ) & _premium_track_access_q(has_premium_access, 'playlisttrack__track__') & _playable_track_q('playlisttrack__track__'),
             )
         )
     )
@@ -2297,9 +2668,13 @@ class PlaylistsListView(APIView):
     permission_classes = []
 
     def get(self, request):
+        _, subscription, is_paywall_locked = _resolve_paywall_context(request)
+        if is_paywall_locked:
+            return _premium_required_response()
+        has_premium_access = subscription is not None
         limit, offset = _parse_limit_offset(request, default_limit=300, max_limit=500)
         query = (request.query_params.get('q') or '').strip()
-        base_queryset = _active_public_playlists_queryset()
+        base_queryset = _active_public_playlists_queryset(has_premium_access=has_premium_access)
         if query:
             base_queryset = base_queryset.filter(
                 Q(title__icontains=query) | Q(description__icontains=query)
@@ -2309,7 +2684,10 @@ class PlaylistsListView(APIView):
         playlists = base_queryset[offset:offset + limit]
         serialized = PlaylistSummarySerializer(playlists, many=True).data
         for row, playlist in zip(serialized, playlists):
-            row['preview_cover_image_urls'] = _playlist_preview_cover_urls(playlist.id)
+            row['preview_cover_image_urls'] = _playlist_preview_cover_urls(
+                playlist.id,
+                has_premium_access=has_premium_access,
+            )
 
         count = len(serialized)
         next_offset = offset + count
@@ -2332,7 +2710,10 @@ class TopPlaylistsView(APIView):
     permission_classes = []
 
     def get(self, request):
-        session = _get_active_user_session_from_request(request)
+        session, subscription, is_paywall_locked = _resolve_paywall_context(request)
+        if is_paywall_locked:
+            return _premium_required_response()
+        has_premium_access = subscription is not None
         limit = request.query_params.get('limit', 20)
         window_days = request.query_params.get('window_days', 30)
         try:
@@ -2351,7 +2732,7 @@ class TopPlaylistsView(APIView):
         playlists = []
         if db_limit > 0:
             playlists = list(
-                _active_public_playlists_queryset()
+                _active_public_playlists_queryset(has_premium_access=has_premium_access)
                 .annotate(
                     click_count=Count(
                         'click_events',
@@ -2368,12 +2749,18 @@ class TopPlaylistsView(APIView):
 
         serialized = PlaylistSummarySerializer(playlists, many=True).data
         for row, playlist in zip(serialized, playlists):
-            row['preview_cover_image_urls'] = _playlist_preview_cover_urls(playlist.id)
+            row['preview_cover_image_urls'] = _playlist_preview_cover_urls(
+                playlist.id,
+                has_premium_access=has_premium_access,
+            )
             row['click_count'] = int(getattr(playlist, 'click_count', 0) or 0)
 
         results = list(serialized)
         if include_liked_songs:
-            liked_row = _serialize_liked_songs_playlist_summary(user=session.user)
+            liked_row = _serialize_liked_songs_playlist_summary(
+                user=session.user,
+                has_premium_access=has_premium_access,
+            )
             results = [liked_row, *results]
             if len(results) > limit:
                 results = results[:limit]
@@ -2392,17 +2779,23 @@ class PlaylistClickCreateView(APIView):
     permission_classes = []
 
     def post(self, request, id):
+        _, subscription, is_paywall_locked = _resolve_paywall_context(request)
+        if is_paywall_locked:
+            return _premium_required_response()
         playlist = (
             Playlist.objects.filter(
                 id=id,
                 deleted_at__isnull=True,
                 is_active=True,
             )
-            .exclude(visibility=Playlist.Visibility.HIDDEN)
             .first()
         )
         if playlist is None:
             return Response({'detail': 'Playlist not found.'}, status=status.HTTP_404_NOT_FOUND)
+        if playlist.visibility == Playlist.Visibility.HIDDEN:
+            return Response({'detail': 'Playlist not found.'}, status=status.HTTP_404_NOT_FOUND)
+        if playlist.visibility == Playlist.Visibility.PREMIUM and subscription is None:
+            return _premium_required_response()
 
         serializer = PlaylistClickCreateSerializer(data=request.data or {})
         serializer.is_valid(raise_exception=True)
@@ -2433,8 +2826,8 @@ class PlaylistClickCreateView(APIView):
 class PlaylistTracksView(APIView):
     permission_classes = []
 
-    def _get_playlist(self, playlist_id):
-        return _active_public_playlists_queryset().filter(id=playlist_id).first()
+    def _get_playlist(self, playlist_id, *, has_premium_access: bool):
+        return _active_public_playlists_queryset(has_premium_access=has_premium_access).filter(id=playlist_id).first()
 
     def _serialize_track_row(self, *, track, position):
         return {
@@ -2450,16 +2843,22 @@ class PlaylistTracksView(APIView):
         }
 
     def _liked_songs_response(self, *, request):
-        session = _get_active_user_session_from_request(request)
+        session, subscription, is_paywall_locked = _resolve_paywall_context(request)
         if session is None:
             return Response({'detail': 'Not authenticated.'}, status=status.HTTP_401_UNAUTHORIZED)
+        if is_paywall_locked:
+            return _premium_required_response()
+        has_premium_access = subscription is not None
 
-        liked_rows = list(_liked_tracks_queryset_for_user(session.user))
+        liked_rows = list(_liked_tracks_queryset_for_user(session.user, has_premium_access=has_premium_access))
         serialized_tracks = [
             self._serialize_track_row(track=row.track, position=index)
             for index, row in enumerate(liked_rows, start=1)
         ]
-        liked_summary = _serialize_liked_songs_playlist_summary(user=session.user)
+        liked_summary = _serialize_liked_songs_playlist_summary(
+            user=session.user,
+            has_premium_access=has_premium_access,
+        )
 
         return Response(
             {
@@ -2480,11 +2879,25 @@ class PlaylistTracksView(APIView):
         )
 
     def get(self, request, id):
+        _, subscription, is_paywall_locked = _resolve_paywall_context(request)
+        if is_paywall_locked:
+            return _premium_required_response()
+        has_premium_access = subscription is not None
         if id == LIKED_SONGS_PLAYLIST_ID:
             return self._liked_songs_response(request=request)
 
-        playlist = self._get_playlist(id)
+        playlist = self._get_playlist(id, has_premium_access=has_premium_access)
         if playlist is None:
+            if (
+                not has_premium_access
+                and Playlist.objects.filter(
+                    id=id,
+                    deleted_at__isnull=True,
+                    is_active=True,
+                    visibility=Playlist.Visibility.PREMIUM,
+                ).exists()
+            ):
+                return _premium_required_response()
             return Response({'detail': 'Playlist not found.'}, status=status.HTTP_404_NOT_FOUND)
 
         tracks = (
@@ -2494,6 +2907,7 @@ class PlaylistTracksView(APIView):
                 track__status=Track.Status.PUBLISHED,
                 track__visibility=Track.Visibility.PUBLIC,
             )
+            .filter(_premium_track_access_q(has_premium_access, 'track__'))
             .filter(_playable_track_q('track__'))
             .select_related('track').prefetch_related('track__cover_images')
             .order_by('position', 'created_at')
@@ -2535,6 +2949,10 @@ class LibraryPodcastsTracksView(APIView):
     permission_classes = []
 
     def get(self, request):
+        _, subscription, is_paywall_locked = _resolve_paywall_context(request)
+        if is_paywall_locked:
+            return _premium_required_response()
+        has_premium_access = subscription is not None
         limit, offset = _parse_limit_offset(request, default_limit=30, max_limit=200)
         base_queryset = (
             Track.objects.filter(
@@ -2543,6 +2961,7 @@ class LibraryPodcastsTracksView(APIView):
                 visibility=Track.Visibility.PUBLIC,
                 category__name__iexact='podcast',
             )
+            .filter(_premium_track_access_q(has_premium_access))
             .filter(_playable_track_q())
         )
         total_count = base_queryset.count()
@@ -2572,6 +2991,10 @@ class LibrarySongsTracksView(APIView):
     permission_classes = []
 
     def get(self, request):
+        _, subscription, is_paywall_locked = _resolve_paywall_context(request)
+        if is_paywall_locked:
+            return _premium_required_response()
+        has_premium_access = subscription is not None
         limit, offset = _parse_limit_offset(request, default_limit=30, max_limit=200)
         base_queryset = (
             Track.objects.filter(
@@ -2579,6 +3002,7 @@ class LibrarySongsTracksView(APIView):
                 status=Track.Status.PUBLISHED,
                 visibility=Track.Visibility.PUBLIC,
             )
+            .filter(_premium_track_access_q(has_premium_access))
             .filter(_playable_track_q())
             .exclude(category__name__iexact='podcast')
         )
@@ -2609,6 +3033,10 @@ class SearchTracksView(APIView):
     permission_classes = []
 
     def get(self, request):
+        _, subscription, is_paywall_locked = _resolve_paywall_context(request)
+        if is_paywall_locked:
+            return _premium_required_response()
+        has_premium_access = subscription is not None
         query = (request.query_params.get('q') or '').strip()
         limit = request.query_params.get('limit', 20)
         try:
@@ -2632,6 +3060,7 @@ class SearchTracksView(APIView):
                 status=Track.Status.PUBLISHED,
                 visibility=Track.Visibility.PUBLIC,
             )
+            .filter(_premium_track_access_q(has_premium_access))
             .filter(_playable_track_q())
             .filter(
                 Q(title__icontains=query)
@@ -2658,6 +3087,9 @@ class SearchSuggestionsView(APIView):
     permission_classes = []
 
     def get(self, request):
+        _, _, is_paywall_locked = _resolve_paywall_context(request)
+        if is_paywall_locked:
+            return _premium_required_response()
         min_count = request.query_params.get('min_count', 100)
         limit = request.query_params.get('limit', 12)
         try:
@@ -2700,6 +3132,10 @@ class CategoriesListView(APIView):
     permission_classes = []
 
     def get(self, request):
+        _, subscription, is_paywall_locked = _resolve_paywall_context(request)
+        if is_paywall_locked:
+            return _premium_required_response()
+        has_premium_access = subscription is not None
         categories = (
             Category.objects.annotate(
                 track_count=Count(
@@ -2708,7 +3144,7 @@ class CategoriesListView(APIView):
                         track__deleted_at__isnull=True,
                         track__status=Track.Status.PUBLISHED,
                         track__visibility=Track.Visibility.PUBLIC,
-                    ),
+                    ) & _premium_track_access_q(has_premium_access, 'track__'),
                 )
             )
             .filter(track_count__gt=0)
@@ -2736,6 +3172,10 @@ class CategoryTracksView(APIView):
     permission_classes = []
 
     def get(self, request, id):
+        _, subscription, is_paywall_locked = _resolve_paywall_context(request)
+        if is_paywall_locked:
+            return _premium_required_response()
+        has_premium_access = subscription is not None
         category = Category.objects.filter(id=id).first()
         if category is None:
             return Response({'detail': 'Category not found.'}, status=status.HTTP_404_NOT_FOUND)
@@ -2758,6 +3198,7 @@ class CategoryTracksView(APIView):
                 status=Track.Status.PUBLISHED,
                 visibility=Track.Visibility.PUBLIC,
             )
+            .filter(_premium_track_access_q(has_premium_access))
             .filter(_playable_track_q())
         )
         total_count = base_queryset.count()

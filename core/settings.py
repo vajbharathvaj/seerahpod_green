@@ -86,11 +86,22 @@ ASGI_APPLICATION = 'core.asgi.application'
 #     }
 # }
 
-DATABASES = {
-    "default": dj_database_url.config(
-        default=os.environ.get("DATABASE_URL")
-    )
-}
+database_url = os.getenv("DATABASE_URL", "").strip()
+if database_url:
+    DATABASES = {
+        "default": dj_database_url.config(default=database_url),
+    }
+else:
+    DATABASES = {
+        "default": {
+            "ENGINE": "django.db.backends.postgresql",
+            "NAME": os.getenv("POSTGRES_DB", "design1"),
+            "USER": os.getenv("POSTGRES_USER", "postgres"),
+            "PASSWORD": os.getenv("POSTGRES_PASSWORD", "postgres"),
+            "HOST": os.getenv("POSTGRES_HOST", "localhost"),
+            "PORT": os.getenv("POSTGRES_PORT", "5432"),
+        }
+    }
 
 
 AUTH_PASSWORD_VALIDATORS = [
@@ -128,6 +139,11 @@ GOOGLE_OAUTH_CLIENT_ID = os.getenv('GOOGLE_OAUTH_CLIENT_ID', '').strip()
 # Preferred client ID for /api/v1/auth/google/* endpoints used by the Flutter app.
 # Falls back to GOOGLE_OAUTH_CLIENT_ID in view code if unset.
 GOOGLE_OAUTH_MOBILE_CLIENT_ID = os.getenv('GOOGLE_OAUTH_MOBILE_CLIENT_ID', '').strip()
+
+# Billing verification (Google Play)
+GOOGLE_PLAY_SERVICE_ACCOUNT_JSON = os.getenv('GOOGLE_PLAY_SERVICE_ACCOUNT_JSON', '').strip()
+GOOGLE_PLAY_SERVICE_ACCOUNT_FILE = os.getenv('GOOGLE_PLAY_SERVICE_ACCOUNT_FILE', '').strip()
+GOOGLE_PLAY_STRICT_VERIFY = os.getenv('GOOGLE_PLAY_STRICT_VERIFY', '0') == '1'
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
