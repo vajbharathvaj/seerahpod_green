@@ -89,17 +89,20 @@ ASGI_APPLICATION = 'core.asgi.application'
 database_url = os.getenv("DATABASE_URL", "").strip()
 if database_url:
     DATABASES = {
-        "default": dj_database_url.config(default=database_url),
+        "default": dj_database_url.parse(database_url, conn_max_age=600),
     }
 else:
     DATABASES = {
         "default": {
             "ENGINE": "django.db.backends.postgresql",
-            "NAME": os.getenv("POSTGRES_DB", "design1"),
-            "USER": os.getenv("POSTGRES_USER", "postgres"),
-            "PASSWORD": os.getenv("POSTGRES_PASSWORD", "postgres"),
-            "HOST": os.getenv("POSTGRES_HOST", "localhost"),
-            "PORT": os.getenv("POSTGRES_PORT", "5432"),
+            "NAME": os.getenv("PGDATABASE", os.getenv("POSTGRES_DB", "design1")),
+            "USER": os.getenv("PGUSER", os.getenv("POSTGRES_USER", "postgres")),
+            "PASSWORD": os.getenv(
+                "PGPASSWORD",
+                os.getenv("POSTGRES_PASSWORD", "postgres"),
+            ),
+            "HOST": os.getenv("PGHOST", os.getenv("POSTGRES_HOST", "localhost")),
+            "PORT": os.getenv("PGPORT", os.getenv("POSTGRES_PORT", "5432")),
         }
     }
 
