@@ -15,6 +15,20 @@ DEBUG = os.getenv('DJANGO_DEBUG', '1') == '1'
 allowed_hosts = os.getenv('DJANGO_ALLOWED_HOSTS', 'localhost,127.0.0.1').split(',')
 ALLOWED_HOSTS = [host.strip() for host in allowed_hosts if host.strip()]
 
+# Allow Railway public host automatically when deployed.
+railway_public_domain = os.getenv('RAILWAY_PUBLIC_DOMAIN', '').strip()
+if railway_public_domain:
+    ALLOWED_HOSTS.append(railway_public_domain)
+
+# Normalize accidental scheme prefixes and remove duplicates.
+ALLOWED_HOSTS = list(
+    dict.fromkeys(
+        host.replace('https://', '').replace('http://', '').strip().rstrip('/')
+        for host in ALLOWED_HOSTS
+        if host and host.strip()
+    )
+)
+
 CORS_ALLOWED_ORIGINS = [
     'https://seerahpodadmin-frontend.vercel.app',
 ]
